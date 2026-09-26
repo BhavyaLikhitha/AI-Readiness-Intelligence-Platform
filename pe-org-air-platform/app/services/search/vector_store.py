@@ -613,22 +613,30 @@ class VectorStore:
                 logger.warning("local_get_all_metadata_error error=%s", e)
         return all_metas
 
-    def get_all_documents(self) -> List["SearchResult"]:
-        """Paginate through entire collection, returning IDs + content + metadata.
+    def get_all_documents(self, limit: Optional[int] = None) -> List["SearchResult"]:
+        """Paginate through the collection, returning IDs + content + metadata.
 
         Same pagination strategy as get_all_metadata() but includes documents.
         Used by HybridRetriever.rebuild_sparse_index_from_chroma().
+
+        `limit` bounds how many documents are pulled into memory (and thus how
+        big the resulting BM25 corpus is) — without it, an unbounded fetch of
+        the full collection at every app startup was large enough to OOM-kill
+        the process on memory-constrained instances (e.g. Render's 512MB tier).
         """
         all_docs: List[SearchResult] = []
         if self._use_cloud and self._collection_id:
             offset = 0
             batch = 300
             while True:
+                if limit is not None and len(all_docs) >= limit:
+                    break
+                fetch_n = batch if limit is None else min(batch, limit - len(all_docs))
                 try:
                     resp = requests.post(
                         f"{self._base_url()}/collections/{self._collection_id}/get",
                         headers=self._headers(),
-                        json={"limit": batch, "offset": offset, "include": ["documents", "metadatas"]},
+                        json={"limit": fetch_n, "offset": offset, "include": ["documents", "metadatas"]},
                         timeout=30,
                     )
                     if resp.status_code != 200:
@@ -649,7 +657,7 @@ class VectorStore:
                             distance=0.0,
                         ))
                     offset += len(ids)
-                    if len(ids) < batch:
+                    if len(ids) < fetch_n:
                         break
                 except Exception as e:
                     logger.warning("get_all_documents_error error=%s", e)

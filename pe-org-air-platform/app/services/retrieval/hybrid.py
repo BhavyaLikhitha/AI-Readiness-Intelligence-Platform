@@ -42,6 +42,14 @@ logger = logging.getLogger(__name__)
 # How many docs to pull from ChromaDB to seed BM25 at startup.
 BM25_SEED_LIMIT = 500
 
+# Cap for the full-corpus BM25 rebuild (rebuild_sparse_index_from_chroma).
+# An uncapped fetch of the entire collection was large enough on its own to
+# OOM-kill the process at boot on memory-constrained instances (e.g. Render's
+# 512MB tier) — this bounds memory regardless of how much evidence has been
+# indexed. Dense (Chroma) search is unaffected and does most of the retrieval
+# work anyway (dense_weight=0.6 vs sparse_weight=0.4 below).
+BM25_REBUILD_MAX_DOCS = 2000
+
 # If fewer than this many ticker-specific docs are in the BM25 corpus,
 # trigger a per-ticker re-seed before sparse scoring.
 BM25_TICKER_MIN_DOCS = 50
@@ -323,8 +331,9 @@ class HybridRetriever:
 
         # Uses get_all_documents() instead of collection.get() — retrieves complete corpus
         # including metadata, not just a seed-query subset. This is intentionally more
-        # comprehensive than the plan's original collection.get() approach.
-        all_results = self._vector_store.get_all_documents()
+        # comprehensive than the plan's original collection.get() approach, bounded by
+        # BM25_REBUILD_MAX_DOCS to keep memory use predictable.
+        all_results = self._vector_store.get_all_documents(limit=BM25_REBUILD_MAX_DOCS)
         if not all_results:
             logger.info("rebuild_sparse_skipped reason=no_documents_in_chroma")
             return 0
