@@ -30,6 +30,9 @@ RUN apt-get update && apt-get install -y \
 
 # Copy and install Python dependencies
 COPY requirements.txt ./
+# CPU-only torch first — sentence-transformers otherwise pulls the CUDA build
+# (several GB of unused nvidia-* wheels), which blows out build time/disk on Render.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright Chromium browser binary

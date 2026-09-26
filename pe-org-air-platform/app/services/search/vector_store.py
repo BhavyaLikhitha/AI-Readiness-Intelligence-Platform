@@ -28,13 +28,6 @@ from typing import List, Optional, Dict, Any
 
 import requests
 
-try:
-    from sentence_transformers import SentenceTransformer
-    _ST_AVAILABLE = True
-except Exception:
-    _ST_AVAILABLE = False
-    SentenceTransformer = None
-
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "pe_evidence"
@@ -88,13 +81,9 @@ class VectorStore:
         self._init()
 
     def _init(self):
-        # Initialize sentence transformer
-        if _ST_AVAILABLE:
-            try:
-                self._encoder = SentenceTransformer(EMBEDDING_MODEL)
-            except Exception as e:
-                logger.warning("sentence_transformer_failed error=%s", e)
-
+        # NOTE: sentence-transformers/torch are NOT loaded here — see _get_encoder().
+        # Loading them eagerly at app startup (before the port opens) pushed memory
+        # over Render's instance limit and caused OOM-kill during deploy.
         if self._use_cloud:
             self._collection_id = self._ensure_collection()
             if self._collection_id:
@@ -164,10 +153,28 @@ class VectorStore:
         except Exception as e:
             logger.warning("local_chromadb_failed error=%s", e)
 
-    def _encode(self, texts: List[str]) -> List[List[float]]:
+    def _get_encoder(self) -> Optional[Any]:
+        """Lazily import + load the sentence-transformers model on first use.
+
+        Deferring the import (not just the instantiation) matters — `import
+        sentence_transformers` pulls in torch, which by itself is a large chunk
+        of memory. Doing this at module load time (i.e. at app startup) was
+        pushing total memory over Render's instance limit and getting the
+        process OOM-killed before it ever opened its port.
+        """
         if self._encoder is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._encoder = SentenceTransformer(EMBEDDING_MODEL)
+            except Exception as e:
+                logger.warning("sentence_transformer_failed error=%s", e)
+        return self._encoder
+
+    def _encode(self, texts: List[str]) -> List[List[float]]:
+        encoder = self._get_encoder()
+        if encoder is None:
             return [[0.0] * 384 for _ in texts]
-        return self._encoder.encode(texts, show_progress_bar=False).tolist()
+        return encoder.encode(texts, show_progress_bar=False).tolist()
 
     def _cloud_upsert(self, ids, documents, embeddings, metadatas) -> bool:
         try:

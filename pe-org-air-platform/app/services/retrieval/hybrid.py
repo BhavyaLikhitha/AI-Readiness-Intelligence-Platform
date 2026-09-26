@@ -35,13 +35,6 @@ try:
 except ImportError:
     _BM25_AVAILABLE = False
 
-try:
-    from sentence_transformers import SentenceTransformer
-    _ST_AVAILABLE = True
-except Exception:
-    _ST_AVAILABLE = False
-    SentenceTransformer = None
-
 from app.services.search.vector_store import VectorStore, SearchResult
 
 logger = logging.getLogger(__name__)
@@ -116,9 +109,14 @@ class HybridRetriever:
         # Track which tickers have already been seeded into BM25
         self._seeded_tickers: Set[str] = set()
 
-        # Try pickle first, then fall back to ChromaDB seeding
-        if not self._try_load_pickle():
-            self._load_bm25_from_store()
+        # Try pickle first. Do NOT fall back to _load_bm25_from_store() here —
+        # it calls vector_store.search(), which forces the sentence-transformers
+        # model to load eagerly during construction (OOM risk at app startup on
+        # memory-constrained instances). Callers that need a populated sparse
+        # index without a pickle hit should call rebuild_sparse_index_from_chroma()
+        # (metadata-only, no embeddings) or seed_from_evidence() explicitly —
+        # app/core/lifespan.py already does this right after construction.
+        self._try_load_pickle()
 
     @property
     def sparse_index_size(self) -> int:
