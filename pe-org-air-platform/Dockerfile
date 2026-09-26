@@ -38,6 +38,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Playwright Chromium browser binary
 RUN playwright install chromium
 
+# Pre-download the embedding model into the image so the first RAG request
+# never has to fetch it from Hugging Face over the network. Downloading it
+# mid-request (inside the single-worker event loop) was blocking the whole
+# service — including /health — for minutes and looking like a hang/crash.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 # Copy application source code
 COPY app/ ./app/
 
