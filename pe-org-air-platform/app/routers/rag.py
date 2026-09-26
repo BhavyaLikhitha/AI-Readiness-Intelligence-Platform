@@ -293,7 +293,7 @@ def _build_filter(
 
 # ── Retrieval with fallback ────────────────────────────────────────────────────
 
-async def _retrieve_with_fallback(
+def _retrieve_with_fallback(
     retriever: HybridRetriever,
     query: str,
     ticker: str,
@@ -308,6 +308,12 @@ async def _retrieve_with_fallback(
 
     FIX: When dimension is None (broad questions), retrieves across ALL
     source types to give balanced evidence from SEC, jobs, Glassdoor, patents.
+
+    NOTE: plain `def`, not `async def` — every call inside (Chroma Cloud HTTP,
+    BM25, embedding) is synchronous/blocking. It was previously declared async
+    with no actual `await`s, meaning calling it still ran all of this directly
+    on the event loop thread, freezing the entire process (including /health)
+    for the whole duration. Call sites now run it via asyncio.to_thread().
     """
     vs = vector_store or _get_vector_store()
 
@@ -468,6 +474,59 @@ async def _retrieve_with_fallback(
             return sec_fallback
 
     return fallback if len(fallback) > len(results) else results
+
+
+def _build_score_context(ticker: str, scoring_repo, signal_repo) -> str:
+    """Build the structured-score context block for the chatbot prompt.
+
+    Plain sync function — Snowflake/S3 calls, run via asyncio.to_thread by the
+    caller to keep the event loop free.
+    """
+    score_context = ""
+    try:
+        dim_rows = scoring_repo.get_dimension_scores(ticker)
+        if dim_rows:
+            score_lines = [
+                f"  {d['dimension'].replace('_',' ').title()}: {float(d['score']):.1f}/100"
+                for d in dim_rows if d.get("dimension") and d.get("score") is not None
+            ]
+            if score_lines:
+                score_context += "\nDIMENSION SCORES:\n" + "\n".join(score_lines)
+    except Exception as e:
+        logger.warning("rag.score_enrich_dims_failed", error=str(e))
+
+    try:
+        summary = signal_repo.get_summary_by_ticker(ticker)
+        if summary:
+            sig_lines = []
+            for k, v in summary.items():
+                if k.endswith("_score") and v is not None and "composite" not in k:
+                    label = k.replace("_score", "").replace("_", " ").title()
+                    sig_lines.append(f"  {label}: {v}/100")
+            composite = summary.get("composite_score")
+            if composite:
+                sig_lines.insert(0, f"  Composite: {composite}/100")
+            if sig_lines:
+                score_context += "\nSIGNAL SCORES:\n" + "\n".join(sig_lines)
+    except Exception as e:
+        logger.warning("rag.score_enrich_signals_failed", error=str(e))
+
+    try:
+        from app.services.signals.culture_signal_service import get_culture_signal_service
+        cult_svc = get_culture_signal_service()
+        cult_data, _ = cult_svc.get(ticker)
+        if cult_data and cult_data.get("overall_score"):
+            score_context += (
+                f"\nCULTURE ({cult_data.get('review_count', 0)} reviews): "
+                f"Overall={cult_data['overall_score']}/100, "
+                f"Innovation={cult_data.get('innovation_score', 'N/A')}, "
+                f"AI Awareness={cult_data.get('ai_awareness_score', 'N/A')}, "
+                f"Change Readiness={cult_data.get('change_readiness_score', 'N/A')}"
+            )
+    except Exception as e:
+        logger.warning("rag.score_enrich_culture_failed", error=str(e))
+
+    return score_context
 
 
 # ── Request / Response Models ─────────────────────────────────────────────────
@@ -702,7 +761,8 @@ async def search_evidence(
             dimension=dimension or "",
         )
     elif req.ticker:
-        results = await _retrieve_with_fallback(
+        results = await asyncio.to_thread(
+            _retrieve_with_fallback,
             retriever=retriever,
             query=req.query,
             ticker=req.ticker,
@@ -938,7 +998,8 @@ async def chatbot_query(
     logger.info("rag.chatbot_dim_final", ticker=ticker, dimension=detected_dimension,
                 confidence=dim_confidence)
 
-    results = await _retrieve_with_fallback(
+    results = await asyncio.to_thread(
+        _retrieve_with_fallback,
         retriever=retriever,
         query=question,
         ticker=ticker,
@@ -983,53 +1044,12 @@ async def chatbot_query(
         context = context[:MAX_CONTEXT_CHARS] + "\n\n[Context truncated to fit token budget.]"
 
     # ── Enrich context with structured score data ─────────────────────────────
-    # Direct Snowflake/S3 calls — NO HTTP self-requests (avoids deadlock)
-    score_context = ""
-    try:
-        # Dimension scores from evidence_dimension_scores table
-        dim_rows = scoring_repo.get_dimension_scores(ticker)
-        if dim_rows:
-            score_lines = [
-                f"  {d['dimension'].replace('_',' ').title()}: {float(d['score']):.1f}/100"
-                for d in dim_rows if d.get("dimension") and d.get("score") is not None
-            ]
-            if score_lines:
-                score_context += "\nDIMENSION SCORES:\n" + "\n".join(score_lines)
-    except Exception as e:
-        logger.warning("rag.score_enrich_dims_failed", error=str(e))
-
-    try:
-        # Signal summary from company_signal_summaries table
-        summary = signal_repo.get_summary_by_ticker(ticker)
-        if summary:
-            sig_lines = []
-            for k, v in summary.items():
-                if k.endswith("_score") and v is not None and "composite" not in k:
-                    label = k.replace("_score", "").replace("_", " ").title()
-                    sig_lines.append(f"  {label}: {v}/100")
-            composite = summary.get("composite_score")
-            if composite:
-                sig_lines.insert(0, f"  Composite: {composite}/100")
-            if sig_lines:
-                score_context += "\nSIGNAL SCORES:\n" + "\n".join(sig_lines)
-    except Exception as e:
-        logger.warning("rag.score_enrich_signals_failed", error=str(e))
-
-    try:
-        # Culture from S3
-        from app.services.signals.culture_signal_service import get_culture_signal_service
-        cult_svc = get_culture_signal_service()
-        cult_data, _ = cult_svc.get(ticker)
-        if cult_data and cult_data.get("overall_score"):
-            score_context += (
-                f"\nCULTURE ({cult_data.get('review_count', 0)} reviews): "
-                f"Overall={cult_data['overall_score']}/100, "
-                f"Innovation={cult_data.get('innovation_score', 'N/A')}, "
-                f"AI Awareness={cult_data.get('ai_awareness_score', 'N/A')}, "
-                f"Change Readiness={cult_data.get('change_readiness_score', 'N/A')}"
-            )
-    except Exception as e:
-        logger.warning("rag.score_enrich_culture_failed", error=str(e))
+    # Direct Snowflake/S3 calls — NO HTTP self-requests (avoids deadlock).
+    # Run via asyncio.to_thread — these are blocking calls (Snowflake, S3) and
+    # would otherwise freeze the event loop (and /health) for their duration.
+    score_context = await asyncio.to_thread(
+        _build_score_context, ticker, scoring_repo, signal_repo
+    )
 
     dim_instruction = ""
     if detected_dimension and dim_confidence >= _DIM_CONFIDENCE_THRESHOLD:
