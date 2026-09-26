@@ -222,15 +222,15 @@ FALLBACK_QUESTIONS = {
 # ── Data fetchers (NO timeout restrictions) ───────────────────────────────────
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _get_available_companies() -> list:
-    """Fetch ALL companies from Snowflake — no timeout."""
+def _get_available_companies() -> tuple[list, str]:
+    """Fetch ALL companies from Snowflake — no timeout. Returns (items, error)."""
     try:
-        r = requests.get(f"{BASE_URL}/api/v1/companies/all")
+        r = requests.get(f"{BASE_URL}/api/v1/companies/all", timeout=15)
         if r.status_code == 200:
-            return [c for c in r.json().get("items", []) if c.get("ticker")]
-    except Exception:
-        pass
-    return []
+            return ([c for c in r.json().get("items", []) if c.get("ticker")], "")
+        return ([], f"API returned {r.status_code} from {BASE_URL}: {r.text[:300]}")
+    except Exception as e:
+        return ([], f"Could not reach API at {BASE_URL}: {e}")
 
 
 def _normalize_dim_key(key: str) -> str:
@@ -775,11 +775,14 @@ def _render_chat_interface(ticker: str, company_name: str):
 
 def render_chatbot_page():
     # FIX: Fetch ALL companies from Snowflake — chatbot not tied to pipeline
-    available = _get_available_companies()
+    available, fetch_error = _get_available_companies()
 
     if not available:
         st.markdown("## 💬 Company Q&A")
-        st.warning("No companies found in Snowflake. Create a company first via the Pipeline or API.")
+        if fetch_error:
+            st.error(f"Could not load companies — {fetch_error}")
+        else:
+            st.warning("No companies found in Snowflake. Create a company first via the Pipeline or API.")
         if st.button("⚡ Go to Pipeline", type="primary"):
             st.session_state["active_page"] = "pipeline"
             st.rerun()

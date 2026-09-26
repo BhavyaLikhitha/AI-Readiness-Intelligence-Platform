@@ -32,20 +32,44 @@ class ForeignKeyViolationException(RepositoryException):
     """Raised on FOREIGN KEY constraint violation."""
 
 
+def _load_private_key_der(pem_str: str) -> bytes:
+    """Convert a PEM PKCS#8 private key to the DER bytes snowflake-connector expects."""
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(pem_str.encode("utf-8"), password=None)
+    return key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
 def get_snowflake_connection() -> snowflake.connector.SnowflakeConnection:
     """
     Snowflake connection factory.
     This is the single authoritative location for creating Snowflake connections.
+
+    Prefers key-pair auth (SNOWFLAKE_PRIVATE_KEY) when set — required once the
+    Snowflake account enforces MFA, since key-pair auth is exempt from it.
+    Falls back to password auth for local dev.
     """
-    return snowflake.connector.connect(
+    kwargs = dict(
         account=settings.SNOWFLAKE_ACCOUNT,
         user=settings.SNOWFLAKE_USER,
-        password=settings.SNOWFLAKE_PASSWORD.get_secret_value(),
         warehouse=settings.SNOWFLAKE_WAREHOUSE,
         database=settings.SNOWFLAKE_DATABASE,
         schema=settings.SNOWFLAKE_SCHEMA,
         role=settings.SNOWFLAKE_ROLE,
     )
+
+    if settings.SNOWFLAKE_PRIVATE_KEY:
+        kwargs["private_key"] = _load_private_key_der(
+            settings.SNOWFLAKE_PRIVATE_KEY.get_secret_value()
+        )
+    else:
+        kwargs["password"] = settings.SNOWFLAKE_PASSWORD.get_secret_value()
+
+    return snowflake.connector.connect(**kwargs)
 
 
 class BaseRepository:

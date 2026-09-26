@@ -56,11 +56,25 @@ class Settings(BaseSettings):
     # Snowflake
     SNOWFLAKE_ACCOUNT: str
     SNOWFLAKE_USER: str
-    SNOWFLAKE_PASSWORD: SecretStr
+    # Password auth — kept for local dev. Ignored when SNOWFLAKE_PRIVATE_KEY is set,
+    # since Snowflake account-level MFA enforcement blocks plain password logins
+    # for service accounts. Key-pair auth is exempt from that MFA requirement.
+    SNOWFLAKE_PASSWORD: Optional[SecretStr] = None
+    # PEM-encoded PKCS#8 private key (unencrypted), e.g. contents of sf_private_key.p8.
+    SNOWFLAKE_PRIVATE_KEY: Optional[SecretStr] = None
     SNOWFLAKE_DATABASE: str
     SNOWFLAKE_SCHEMA: str
     SNOWFLAKE_WAREHOUSE: str
     SNOWFLAKE_ROLE: str
+
+    @model_validator(mode="after")
+    def validate_snowflake_auth(self):
+        """Require at least one Snowflake auth method."""
+        if not self.SNOWFLAKE_PASSWORD and not self.SNOWFLAKE_PRIVATE_KEY:
+            raise ValueError(
+                "Either SNOWFLAKE_PASSWORD or SNOWFLAKE_PRIVATE_KEY must be set"
+            )
+        return self
 
     # AWS S3
     AWS_ACCESS_KEY_ID: SecretStr
